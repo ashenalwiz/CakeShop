@@ -73,7 +73,7 @@ async function ensureDatabaseExists() {
   const dbConfig = {
     host: process.env.DB_HOST || "localhost",
     port: 5432,
-    ssl: (process.env.DB_HOST && process.env.DB_HOST != 'localhost') ? { ca: fs.readFileSync('global-bundle.pem').toString() } : false,
+    ssl: (process.env.DB_HOST && process.env.DB_HOST != 'localhost') ? { rejectUnauthorized: false } : false,
     user: "postgres",
     password: process.env.DB_PASS || "postgres",
     database: "postgres" // Connect to the default database
@@ -161,7 +161,7 @@ const AppDataSource = new DataSource({
   type: "postgres",
   host: process.env.DB_HOST || "localhost",
   port: 5432,
-  ssl: (process.env.DB_HOST && process.env.DB_HOST != 'localhost') ? { ca: fs.readFileSync('global-bundle.pem').toString() } : false,
+  ssl: (process.env.DB_HOST && process.env.DB_HOST != 'localhost') ? { rejectUnauthorized: false } : false,
   username: "postgres",
   password: process.env.DB_PASS || "postgres",
   database: "sweet_treats_bakery",
