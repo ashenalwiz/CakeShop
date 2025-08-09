@@ -8,16 +8,11 @@ const fs = require("fs");
 const path = require("path");
 
 const app = express();
-const port = process.env.PORT || 3000;
+const port = process.env.PORT || 8080;
 
 // Middleware to parse JSON and URL-encoded bodies
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-
-// Health check endpoint for AWS Load Balancer
-app.get("/health", (req, res) => {
-  res.status(200).json({ status: "OK", timestamp: new Date().toISOString() });
-});
 
 // Define the Product entity with a new "image" field.
 const ProductEntity = new EntitySchema({
@@ -74,40 +69,27 @@ const OrderItemEntity = new EntitySchema({
 
 // Function to ensure the target database exists; if not, create it.
 async function ensureDatabaseExists() {
-  const targetDB = process.env.DB_NAME || "sweet_treats_bakery";
+  const targetDB = "sweet_treats_bakery";
   const dbConfig = {
-    host: process.env.DB_HOST,
-    port: process.env.DB_PORT ? parseInt(process.env.DB_PORT) : 5432,
-    user: process.env.DB_USER,
-    password: process.env.DB_PASS,
-    database: "postgres" // Connect to the default database first
+    host: process.env.DB_HOST || "localhost",
+    port: 5432,
+    ssl: (process.env.DB_HOST && process.env.DB_HOST != 'localhost') ? { ca: fs.readFileSync('global-bundle.pem').toString() } : false,
+    user: "postgres",
+    password: process.env.DB_PASS || "postgres",
+    database: "postgres" // Connect to the default database
   };
 
-  // Add SSL configuration for AWS RDS
-  if (process.env.DB_HOST && !process.env.DB_HOST.includes('localhost')) {
-    dbConfig.ssl = {
-      rejectUnauthorized: false // AWS RDS requires SSL but we'll use flexible SSL
-    };
-  }
-
   const client = new Client(dbConfig);
-  
-  try {
-    await client.connect();
-    console.log("Connected to PostgreSQL server");
+  await client.connect();
 
-    const result = await client.query("SELECT 1 FROM pg_database WHERE datname = $1", [targetDB]);
-    if (result.rowCount === 0) {
-      await client.query(`CREATE DATABASE "${targetDB}"`);
-      console.log(`Database "${targetDB}" created.`);
-    } else {
-      console.log(`Database "${targetDB}" already exists.`);
-    }
-    await client.end();
-  } catch (error) {
-    console.error("Error ensuring database exists:", error);
-    // Don't throw error, let TypeORM handle connection
+  const result = await client.query("SELECT 1 FROM pg_database WHERE datname = $1", [targetDB]);
+  if (result.rowCount === 0) {
+    await client.query(`CREATE DATABASE "${targetDB}"`);
+    console.log(`Database "${targetDB}" created.`);
+  } else {
+    console.log(`Database "${targetDB}" already exists.`);
   }
+  await client.end();
 }
 
 // Function to upload all files from the "static" folder to S3 using AWS SDK v3.
@@ -127,21 +109,14 @@ function uploadStaticFilesToS3() {
     const { S3Client } = require("@aws-sdk/client-s3");
     const { Upload } = require("@aws-sdk/lib-storage");
 
-    // Create S3 client with credentials from environment variables or IAM role
-    const s3ClientConfig = {
-      region: process.env.S3_REGION
-    };
-
-    // Only add credentials if they are provided (for local dev)
-    // In EC2, IAM roles will be used automatically
-    if (process.env.S3_ACCESS_KEY && process.env.S3_SECRET_KEY) {
-      s3ClientConfig.credentials = {
+    // Create S3 client with credentials from environment variables
+    const s3Client = new S3Client({
+      region: process.env.S3_REGION,
+      credentials: {
         accessKeyId: process.env.S3_ACCESS_KEY,
         secretAccessKey: process.env.S3_SECRET_KEY
-      };
-    }
-
-    const s3Client = new S3Client(s3ClientConfig);
+      }
+    });
 
     const staticFolder = path.join(__dirname, "static");
     if (!fs.existsSync(staticFolder)) {
@@ -154,22 +129,15 @@ function uploadStaticFilesToS3() {
         console.error("Error reading static folder:", err);
         return reject(err);
       }
-      
-      if (files.length === 0) {
-        console.log("No files in static folder; skipping S3 upload.");
-        return resolve();
-      }
-
       const uploadPromises = files.map(async (file) => {
         const filePath = path.join(staticFolder, file);
         const fileStream = fs.createReadStream(filePath);
         const uploadParams = {
           Bucket: process.env.S3_BUCKET,
-          Key: file,
-          Body: fileStream,
-          ContentType: getContentType(file)
+          Key: file, // Upload using the file name; adjust for subdirectories if needed
+          Body: fileStream
+          // No ACL is set; files inherit the bucket's default permissions.
         };
-        
         try {
           const parallelUpload = new Upload({
             client: s3Client,
@@ -179,49 +147,27 @@ function uploadStaticFilesToS3() {
           console.log(`Uploaded ${file} to ${data.Location}`);
         } catch (err) {
           console.error(`Error uploading ${file}:`, err);
-          throw err;
         }
       });
-      
       Promise.all(uploadPromises)
-        .then(() => {
-          console.log("All static files uploaded successfully.");
-          resolve();
-        })
+        .then(() => resolve())
         .catch(reject);
     });
   });
 }
 
-// Helper function to determine content type
-function getContentType(filename) {
-  const ext = path.extname(filename).toLowerCase();
-  const contentTypes = {
-    '.jpg': 'image/jpeg',
-    '.jpeg': 'image/jpeg',
-    '.png': 'image/png',
-    '.gif': 'image/gif',
-    '.css': 'text/css',
-    '.js': 'text/javascript',
-    '.html': 'text/html'
-  };
-  return contentTypes[ext] || 'application/octet-stream';
-}
-
 // Configure the data source for PostgreSQL using TypeORM
 const AppDataSource = new DataSource({
   type: "postgres",
-  host: process.env.DB_HOST,
-  port: process.env.DB_PORT ? parseInt(process.env.DB_PORT) : 5432,
-  username: process.env.DB_USER,
-  password: process.env.DB_PASS,
-  database: process.env.DB_NAME || "sweet_treats_bakery",
-  synchronize: true, // Set to false in production after initial setup
-  logging: process.env.NODE_ENV === 'development',
-  entities: [ProductEntity, OrderEntity, OrderItemEntity],
-  ssl: process.env.DB_HOST && !process.env.DB_HOST.includes('localhost') ? {
-    rejectUnauthorized: false
-  } : false
+  host: process.env.DB_HOST || "localhost",
+  port: 5432,
+  ssl: (process.env.DB_HOST && process.env.DB_HOST != 'localhost') ? { ca: fs.readFileSync('global-bundle.pem').toString() } : false,
+  username: "postgres",
+  password: process.env.DB_PASS || "postgres",
+  database: "sweet_treats_bakery",
+  synchronize: true, // Automatically syncs the schema (not recommended for production)
+  logging: false,
+  entities: [ProductEntity, OrderEntity, OrderItemEntity]
 });
 
 // Helper function to render a full HTML page with Bootstrap, Font Awesome, and animation CSS.
@@ -236,38 +182,8 @@ function renderPage(title, content) {
       <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
       <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
       <style>
-        body { 
-          padding-top: 50px; 
-          background: linear-gradient(135deg, #ffecd2 0%, #fcb69f 100%);
-          min-height: 100vh;
-        }
+        body { padding-top: 50px; }
         .container { max-width: 800px; }
-        .hero-banner {
-          border-radius: 15px;
-          box-shadow: 0 10px 30px rgba(0,0,0,0.3);
-          overflow: hidden;
-        }
-        .product-card {
-          border-radius: 15px;
-          box-shadow: 0 5px 15px rgba(0,0,0,0.1);
-          transition: transform 0.3s ease;
-        }
-        .product-card:hover {
-          transform: translateY(-5px);
-        }
-        .btn {
-          border-radius: 25px;
-          padding: 10px 30px;
-          font-weight: bold;
-        }
-        .btn-success {
-          background: linear-gradient(45deg, #56ab2f, #a8e6cf);
-          border: none;
-        }
-        .btn-primary {
-          background: linear-gradient(45deg, #667eea, #764ba2);
-          border: none;
-        }
         /* Fireworks animation styles */
         .fireworks-container {
           position: absolute;
@@ -286,20 +202,11 @@ function renderPage(title, content) {
           0% { transform: translate(0, 0); opacity: 1; }
           100% { transform: translate(var(--dx), var(--dy)); opacity: 0; }
         }
-        .footer {
-          margin-top: 50px;
-          padding: 20px 0;
-          background-color: rgba(255,255,255,0.1);
-          border-radius: 10px;
-        }
       </style>
     </head>
     <body>
       <div class="container">
         ${content}
-        <div class="footer text-center text-muted">
-          <small>Hosted on AWS EC2 • Images stored on S3 • Data on RDS PostgreSQL</small>
-        </div>
       </div>
       <script src="https://code.jquery.com/jquery-3.5.1.slim.min.js"></script>
       <script src="https://cdn.jsdelivr.net/npm/popper.js@1.16.1/dist/umd/popper.min.js"></script>
@@ -310,9 +217,7 @@ function renderPage(title, content) {
 }
 
 // Construct the hero image URL using AWS S3 environment variables.
-const heroImageUrl = process.env.S3_BUCKET && process.env.S3_REGION ? 
-  `https://${process.env.S3_BUCKET}.s3.${process.env.S3_REGION}.amazonaws.com/bakery.jpg` :
-  'https://via.placeholder.com/800x400/ff6b6b/ffffff?text=Sweet+Treats+Bakery';
+const heroImageUrl = `https://${process.env.S3_BUCKET}.s3.${process.env.S3_REGION}.amazonaws.com/bakery.jpg`;
 
 // Home route with a hero banner image from AWS S3.
 app.get("/", (req, res) => {
@@ -331,43 +236,9 @@ app.get("/", (req, res) => {
       ">
         <div class="d-flex h-100 align-items-center justify-content-center">
           <div class="text-center text-white">
-            <h1 class="display-3">🍰 Sweet Treats Bakery 🍰</h1>
-            <p class="lead">Delicious cakes made with love and the finest ingredients.</p>
-            <p class="small">Now powered by AWS Cloud Services!</p>
-            <a class="btn btn-primary btn-lg" href="/products" role="button">
-              <i class="fas fa-birthday-cake"></i> View Our Cakes
-            </a>
-          </div>
-        </div>
-      </div>
-    </div>
-    <div class="mt-5">
-      <div class="row text-center">
-        <div class="col-md-4 mb-4">
-          <div class="card product-card border-0">
-            <div class="card-body">
-              <i class="fas fa-birthday-cake fa-3x text-primary mb-3"></i>
-              <h5 class="card-title">Fresh Daily</h5>
-              <p class="card-text">All our cakes are baked fresh every morning with premium ingredients.</p>
-            </div>
-          </div>
-        </div>
-        <div class="col-md-4 mb-4">
-          <div class="card product-card border-0">
-            <div class="card-body">
-              <i class="fas fa-heart fa-3x text-danger mb-3"></i>
-              <h5 class="card-title">Made with Love</h5>
-              <p class="card-text">Each cake is crafted with passion and attention to detail.</p>
-            </div>
-          </div>
-        </div>
-        <div class="col-md-4 mb-4">
-          <div class="card product-card border-0">
-            <div class="card-body">
-              <i class="fas fa-truck fa-3x text-success mb-3"></i>
-              <h5 class="card-title">Fast Delivery</h5>
-              <p class="card-text">Quick and reliable delivery to your doorstep.</p>
-            </div>
+            <h1 class="display-3">Welcome to Sweet Treats Bakery!</h1>
+            <p class="lead">Delicious cakes made with love.</p>
+            <a class="btn btn-primary btn-lg" href="/products" role="button">View Our Products</a>
           </div>
         </div>
       </div>
@@ -384,46 +255,34 @@ app.get("/products", async (req, res) => {
 
     // Header with a shopping cart icon and a "Cart" button.
     let html = `
-      <div class="d-flex justify-content-between align-items-center mb-4">
-        <h1 class="mb-0"><i class="fas fa-birthday-cake text-primary"></i> Our Delicious Cakes</h1>
+      <div class="d-flex justify-content-end align-items-center mb-3" style="position: relative;">
         <button class="btn btn-secondary" onclick="location.href='/cart'" id="cartButton">
           <span id="cartIcon"><i class="fas fa-shopping-cart"></i></span> Cart (<span id="cartCount">0</span>)
         </button>
       </div>
-      <div class="row">
+      <h1 class="mb-4">Our Products</h1>
+      <div class="list-group">
     `;
 
     products.forEach(product => {
       // Construct the product image URL using S3 environment variables.
-      const imageUrl = process.env.S3_BUCKET && process.env.S3_REGION ? 
-        `https://${process.env.S3_BUCKET}.s3.${process.env.S3_REGION}.amazonaws.com/${product.image}` :
-        `https://via.placeholder.com/300x300/ff6b6b/ffffff?text=${encodeURIComponent(product.name)}`;
-        
+      const imageUrl = `https://${process.env.S3_BUCKET}.s3.${process.env.S3_REGION}.amazonaws.com/${product.image}`;
       html += `
-        <div class="col-md-6 mb-4">
-          <div class="card product-card border-0 h-100">
-            <img src="${imageUrl}" alt="${product.name}" class="card-img-top" style="height:300px; object-fit:cover;" onerror="this.src='https://via.placeholder.com/300x300/ff6b6b/ffffff?text=${encodeURIComponent(product.name)}'" />
-            <div class="card-body d-flex flex-column">
-              <h5 class="card-title text-center">${product.name}</h5>
-              <p class="card-text text-center text-muted mb-3">Premium quality cake</p>
-              <div class="mt-auto">
-                <div class="d-flex justify-content-between align-items-center">
-                  <span class="h4 text-success mb-0">$${product.price.toFixed(2)}</span>
-                  <button class="btn btn-success" onclick="addToCart(${product.id}, '${product.name}', ${product.price})">
-                    <i class="fas fa-cart-plus"></i> Add to Cart
-                  </button>
-                </div>
-              </div>
+        <div class="list-group-item d-flex justify-content-between align-items-center">
+          <div class="d-flex align-items-center">
+            <img src="${imageUrl}" alt="${product.name}" style="width:250px; height:250px; object-fit:cover; margin-right:15px;" />
+            <div>
+              <h5 class="mb-1">${product.name}</h5>
+              <p class="mb-1">$${product.price.toFixed(2)}</p>
             </div>
           </div>
+          <button class="btn btn-success" onclick="addToCart(${product.id}, '${product.name}', ${product.price})">Add to Cart</button>
         </div>`;
     });
     html += `</div>
       <!-- Button at the bottom to go to the shopping cart -->
       <div class="text-center mt-4">
-        <button class="btn btn-primary btn-lg" onclick="location.href='/cart'">
-          <i class="fas fa-shopping-cart"></i> Go to Cart
-        </button>
+        <button class="btn btn-primary" onclick="location.href='/cart'">Go to Cart</button>
       </div>
       <script>
         function addToCart(id, name, price) {
@@ -461,15 +320,12 @@ app.get("/products", async (req, res) => {
           document.body.appendChild(container);
           
           // Create multiple sparkles.
-          for (let i = 0; i < 15; i++) {
+          for (let i = 0; i < 10; i++) {
             const sparkle = document.createElement('div');
             sparkle.className = 'firework';
-            // Random colors for cake celebration
-            const colors = ['#ff6b6b', '#4ecdc4', '#45b7d1', '#f9ca24', '#f0932b'];
-            sparkle.style.background = colors[Math.floor(Math.random() * colors.length)];
             // Random angle and distance.
             const angle = Math.random() * 2 * Math.PI;
-            const distance = Math.random() * 40 + 20;
+            const distance = Math.random() * 30;
             const dx = Math.cos(angle) * distance;
             const dy = Math.sin(angle) * distance;
             sparkle.style.setProperty('--dx', dx + 'px');
@@ -485,7 +341,7 @@ app.get("/products", async (req, res) => {
         document.addEventListener('DOMContentLoaded', updateCartCount);
       </script>
     `;
-    res.send(renderPage("Our Cakes - Sweet Treats Bakery", html));
+    res.send(renderPage("Products - Sweet Treats Bakery", html));
   } catch (error) {
     console.error("Error fetching products:", error);
     res.status(500).send("Error fetching products");
@@ -495,40 +351,25 @@ app.get("/products", async (req, res) => {
 // Cart route: Display current cart items from sessionStorage.
 app.get("/cart", (req, res) => {
   const content = `
-    <div class="text-center mb-4">
-      <h1><i class="fas fa-shopping-cart text-primary"></i> Your Cart</h1>
-    </div>
+    <h1>Your Cart</h1>
     <div id="cartContainer"></div>
-    <div class="text-center mt-4">
-      <a class="btn btn-success btn-lg" href="/checkout">
-        <i class="fas fa-credit-card"></i> Proceed to Checkout
-      </a>
-      <a class="btn btn-secondary btn-lg ml-3" href="/products">
-        <i class="fas fa-arrow-left"></i> Continue Shopping
-      </a>
-    </div>
+    <a class="btn btn-primary mt-3" href="/checkout">Proceed to Checkout</a>
     <script>
       function renderCart() {
         let cart = sessionStorage.getItem('cart');
         let container = document.getElementById('cartContainer');
         if (!cart || JSON.parse(cart).length === 0) {
-          container.innerHTML = '<div class="text-center"><div class="card"><div class="card-body"><i class="fas fa-shopping-cart fa-3x text-muted mb-3"></i><h4>Your cart is empty</h4><p class="text-muted">Add some delicious cakes to get started!</p></div></div></div>';
+          container.innerHTML = '<p>Your cart is empty.</p>';
           return;
         }
         cart = JSON.parse(cart);
-        let html = '<div class="card"><div class="card-body">';
-        let total = 0;
+        let html = '<ul class="list-group">';
         cart.forEach(item => {
-          const itemTotal = item.price * item.quantity;
-          total += itemTotal;
-          html += '<div class="d-flex justify-content-between align-items-center border-bottom py-3">' +
-                    '<div><h6 class="mb-0">' + item.name + '</h6><small class="text-muted">$' + item.price.toFixed(2) + ' each</small></div>' +
-                    '<div class="text-right"><span class="badge badge-primary">' + item.quantity + 'x</span><br>' +
-                    '<strong>$' + itemTotal.toFixed(2) + '</strong></div>' +
-                  '</div>';
+          html += '<li class="list-group-item d-flex justify-content-between align-items-center">' +
+                    item.name + ' - $' + item.price.toFixed(2) + ' x ' + item.quantity +
+                  '</li>';
         });
-        html += '<div class="pt-3"><h4 class="text-right">Total: <span class="text-success">$' + total.toFixed(2) + '</span></h4></div>';
-        html += '</div></div>';
+        html += '</ul>';
         container.innerHTML = html;
       }
       document.addEventListener('DOMContentLoaded', renderCart);
@@ -540,64 +381,39 @@ app.get("/cart", (req, res) => {
 // Checkout page: Show order form and populate cart details from sessionStorage.
 app.get("/checkout", (req, res) => {
   const content = `
-    <div class="text-center mb-4">
-      <h1><i class="fas fa-credit-card text-success"></i> Checkout</h1>
-    </div>
-    <div class="row">
-      <div class="col-md-6">
-        <div class="card">
-          <div class="card-header">
-            <h5><i class="fas fa-list"></i> Order Summary</h5>
-          </div>
-          <div class="card-body">
-            <div id="cartSummary"></div>
-          </div>
-        </div>
+    <h1>Checkout</h1>
+    <div id="cartSummary"></div>
+    <form method="POST" action="/checkout" onsubmit="return prepareOrder()">
+      <div class="form-group">
+        <label for="name">Name:</label>
+        <input type="text" class="form-control" id="name" name="name" required>
       </div>
-      <div class="col-md-6">
-        <div class="card">
-          <div class="card-header">
-            <h5><i class="fas fa-user"></i> Delivery Information</h5>
-          </div>
-          <div class="card-body">
-            <form method="POST" action="/checkout" onsubmit="return prepareOrder()">
-              <div class="form-group">
-                <label for="name"><i class="fas fa-user"></i> Full Name:</label>
-                <input type="text" class="form-control" id="name" name="name" required placeholder="Enter your full name">
-              </div>
-              <div class="form-group">
-                <label for="address"><i class="fas fa-map-marker-alt"></i> Delivery Address:</label>
-                <textarea class="form-control" id="address" name="address" rows="4" required placeholder="Enter your complete delivery address"></textarea>
-              </div>
-              <input type="hidden" id="cartData" name="cartData">
-              <button type="submit" class="btn btn-success btn-lg btn-block">
-                <i class="fas fa-check"></i> Place Order
-              </button>
-            </form>
-          </div>
-        </div>
+      <div class="form-group">
+        <label for="address">Address:</label>
+        <textarea class="form-control" id="address" name="address" rows="3" required></textarea>
       </div>
-    </div>
+      <input type="hidden" id="cartData" name="cartData">
+      <button type="submit" class="btn btn-success">Place Order</button>
+    </form>
     <script>
       function renderCartSummary() {
         let cart = sessionStorage.getItem('cart');
         let summary = document.getElementById('cartSummary');
         if (!cart || JSON.parse(cart).length === 0) {
-          summary.innerHTML = '<p class="text-center text-muted">Your cart is empty.</p>';
+          summary.innerHTML = '<p>Your cart is empty.</p>';
           return;
         }
         cart = JSON.parse(cart);
-        let html = '';
+        let html = '<ul class="list-group mb-3">';
         let total = 0;
         cart.forEach(item => {
-          const itemTotal = item.price * item.quantity;
-          total += itemTotal;
-          html += '<div class="d-flex justify-content-between border-bottom py-2">' +
-                    '<span>' + item.name + ' x' + item.quantity + '</span>' +
-                    '<span>$' + itemTotal.toFixed(2) + '</span>' +
-                  '</div>';
+          total += item.price * item.quantity;
+          html += '<li class="list-group-item d-flex justify-content-between align-items-center">' +
+                    item.name + ' - $' + item.price.toFixed(2) + ' x ' + item.quantity +
+                  '</li>';
         });
-        html += '<div class="d-flex justify-content-between pt-2"><strong>Total: </strong><strong class="text-success">$' + total.toFixed(2) + '</strong></div>';
+        html += '</ul>';
+        html += '<h4>Total: $' + total.toFixed(2) + '</h4>';
         summary.innerHTML = html;
       }
       
@@ -643,22 +459,10 @@ app.post("/checkout", async (req, res) => {
     const savedOrder = await orderRepository.save(order);
     const content = `
       <div class="text-center">
-        <div class="card">
-          <div class="card-body">
-            <i class="fas fa-check-circle fa-5x text-success mb-4"></i>
-            <h1 class="text-success">Thank you for your order!</h1>
-            <p class="lead">Your order ID is <strong>#${savedOrder.id}</strong></p>
-            <p>We appreciate your business! Your delicious cakes will be prepared with care and delivered soon.</p>
-            <div class="mt-4">
-              <a class="btn btn-primary btn-lg" href="/" onclick="clearCart()">
-                <i class="fas fa-home"></i> Back to Home
-              </a>
-              <a class="btn btn-success btn-lg ml-3" href="/products" onclick="clearCart()">
-                <i class="fas fa-birthday-cake"></i> Order More Cakes
-              </a>
-            </div>
-          </div>
-        </div>
+        <h1>Thank you for your order!</h1>
+        <p>Your order ID is ${savedOrder.id}.</p>
+        <p>We appreciate your business. Your delicious cakes are on their way!</p>
+        <a class="btn btn-primary" href="/" onclick="clearCart()">Back to Home</a>
       </div>
       <script>
         function clearCart() {
@@ -674,70 +478,31 @@ app.post("/checkout", async (req, res) => {
   }
 });
 
-// Error handling middleware
-app.use((err, req, res, next) => {
-  console.error('Error:', err);
-  res.status(500).send('Something went wrong!');
-});
-
-// Graceful shutdown handling
-process.on('SIGTERM', async () => {
-  console.log('SIGTERM received, shutting down gracefully');
-  if (AppDataSource.isInitialized) {
-    await AppDataSource.destroy();
-  }
-  process.exit(0);
-});
-
-// Initialize the application
-async function startApp() {
-  try {
-    console.log('Starting Sweet Treats Bakery application...');
-    console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
-    console.log(`Port: ${port}`);
-    
-    // Ensure database exists
-    await ensureDatabaseExists();
-    
-    // Upload static files to S3
-    await uploadStaticFilesToS3();
-    
-    // Initialize TypeORM
-    await AppDataSource.initialize();
-    console.log("Database connected successfully!");
-    
-    // Seed default products if none exist
+// Ensure the target database exists, upload static files to S3, then initialize TypeORM and start the server.
+ensureDatabaseExists()
+  .then(() => uploadStaticFilesToS3())
+  .then(() => AppDataSource.initialize())
+  .then(async () => {
+    console.log("Database connected.");
+    // Seed default products if none exist.
     const productRepository = AppDataSource.getRepository("Product");
     const count = await productRepository.count();
     if (count === 0) {
       const defaultProducts = [
-        { name: "Chocolate Fudge Cake", price: 25.99, image: "chocolate_cake.jpg" },
-        { name: "Strawberry Cheesecake", price: 28.50, image: "strawberry_cheesecake.jpg" },
-        { name: "Red Velvet Cake", price: 24.75, image: "red_velvet.jpg" },
-        { name: "Vanilla Birthday Cake", price: 22.99, image: "vanilla_birthday.jpg" },
-        { name: "Lemon Drizzle Cake", price: 21.50, image: "lemon_drizzle.jpg" },
-        { name: "Carrot Cake", price: 23.99, image: "carrot_cake.jpg" }
+        { name: "Chocolate Fudge Cake", price: 25.99, image: "chocolate_cake.png" },
+        { name: "Strawberry Cheesecake", price: 28.50, image: "strawberry_cheesecake.png" },
+        { name: "Red Velvet Cake", price: 24.75, image: "red_velvet.png" },
+        { name: "Vanilla Birthday Cake", price: 22.99, image: "vanilla_birthday.png" },
+        { name: "Lemon Drizzle Cake", price: 21.50, image: "lemon_drizzle.png" },
+        { name: "Carrot Cake", price: 23.99, image: "carrot_cake.png" }
       ];
       for (const prod of defaultProducts) {
         await productRepository.save(prod);
       }
-      console.log("Inserted default cake products.");
+      console.log("Inserted default products.");
     }
-    
-    // Start the server
-    app.listen(port, '0.0.0.0', () => {
-      console.log(` Sweet Treats Bakery is running!`);
-      console.log(` Server: http://0.0.0.0:${port}`);
-      console.log(` Health check: http://0.0.0.0:${port}/health`);
-      console.log(` Database: ${process.env.DB_HOST}:${process.env.DB_PORT}/${process.env.DB_NAME}`);
-      console.log(` S3 Bucket: ${process.env.S3_BUCKET || 'Not configured'}`);
+    app.listen(port, () => {
+      console.log(`Server is running on http://localhost:${port}`);
     });
-    
-  } catch (error) {
-    console.error(" Error starting application:", error);
-    process.exit(1);
-  }
-}
-
-// Start the application
-startApp();
+  })
+  .catch(error => console.log(" Error starting application:", error));
